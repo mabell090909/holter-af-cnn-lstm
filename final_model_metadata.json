@@ -1,0 +1,18 @@
+{
+    "median_best_epoch": 2,
+    "median_optimal_threshold": 0.5763,
+    "cv_best_epochs": [
+        4,
+        2,
+        2,
+        2,
+        1
+    ],
+    "cv_optimal_thresholds": [
+        0.5763157894736841,
+        0.2,
+        0.6789473684210525,
+        0.26842105263157895,
+        0.713157894736842
+    ]
+}
