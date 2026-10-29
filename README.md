@@ -128,7 +128,7 @@ If you use this code or methodology in your research, please cite our article:
   journal={MethodsX},
   year={2026},
   publisher={Elsevier},
-  doi={10.5281/zenodo.placeholder}
+  doi={10.5281/zenodo.23666224}
 }
 ```
 
