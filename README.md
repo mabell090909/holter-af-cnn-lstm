@@ -3,7 +3,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10.11-blue.svg)](https://www.python.org/)
 [![TensorFlow 2.13.0](https://img.shields.io/badge/TensorFlow-2.13.0-orange.svg)](https://tensorflow.org/)
-[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.placeholder.svg)](https://doi.org/10.5281/zenodo.placeholder)
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.23666224.svg)](https://doi.org/10.5281/zenodo.23666224)
 
 This repository contains the official, fully reproducible implementation of the machine learning pipeline, statistical validation protocols, and real-time inference server described in our article submitted to ***MethodsX*** (Elsevier):
 
