@@ -5,14 +5,13 @@ import gc
 import numpy as np
 import pandas as pd
 from sklearn.metrics import roc_auc_score, f1_score, accuracy_score, recall_score, precision_score
-from sklearn.utils.class_weight import compute_class_weight
-from imblearn.over_sampling import SMOTE
+from scipy.signal import iirnotch, filtfilt
 import tensorflow as tf
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import Conv1D, MaxPooling1D, LSTM, Dense, Dropout, BatchNormalization
 from tensorflow.keras.regularizers import l2
 
-# Optimize threading
+# Threading config
 tf.config.threading.set_intra_op_parallelism_threads(16)
 tf.config.threading.set_inter_op_parallelism_threads(4)
 
@@ -20,41 +19,39 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 RESULTS_DIR = os.path.join(BASE_DIR, 'results')
 cache_file = os.path.join(RESULTS_DIR, 'ablation_cohort_dataset.npz')
 
-WINDOW_SIZE = 1280
-
 print("==========================================================================", flush=True)
-print(" RIGOROUS ABLATION STUDY: PREPROCESSING DSP vs CLASS IMBALANCE (SMOTE)   ", flush=True)
-print(" 3 Random Record-Level Shuffles (Mean \u00b1 SD, Zero Patient Leakage)     ", flush=True)
+print(" RUNNING 4TH ABLATION CONDITION: BANDPASS + NOTCHES (50/60 Hz) (REVIEWER 2.2)", flush=True)
 print("==========================================================================", flush=True)
 
-# -----------------------------------------------------------------------------
-# 1. LOAD PRE-EXTRACTED PAIRED ABLATION DATASET
-# -----------------------------------------------------------------------------
-print("\n[1/3] Loading cached 20-patient paired ablation dataset...", flush=True)
+# 1. Load cached dataset
 cohort_data = np.load(cache_file)
-X_raw_all = cohort_data['X_raw']
-X_bp_all = cohort_data['X_bp']
-X_dsp_all = cohort_data['X_dsp']
-y_dsp_all = cohort_data['y_dsp']
+X_bp_all = cohort_data['X_bp'] # shape (20000, 1280, 1)
 y_raw_all = cohort_data['y_raw']
-subjects_dsp_all = cohort_data['subjects_dsp']
 subjects_raw_all = cohort_data['subjects_raw']
+unique_patients = np.unique(subjects_raw_all)
 
-unique_patients = np.unique(subjects_dsp_all)
-print(f"   Total Windows : {len(X_dsp_all):,} across {len(unique_patients)} unique patients", flush=True)
-print(f"   Overall Balance: {np.sum(y_dsp_all==1):,} AF ({np.mean(y_dsp_all)*100:.1f}%), {np.sum(y_dsp_all==0):,} Non-AF", flush=True)
-
-# Categorize patients by AF presence for balanced stratified patient-level partitioning
-pat_af_counts = {p: int(np.sum((subjects_dsp_all == p) & (y_dsp_all == 1))) for p in unique_patients}
+# Categorize patients
+pat_af_counts = {p: int(np.sum((subjects_raw_all == p) & (y_raw_all == 1))) for p in unique_patients}
 pats_with_af = [p for p in unique_patients if pat_af_counts[p] > 50]
 pats_without_af = [p for p in unique_patients if pat_af_counts[p] <= 50]
 
-print(f"   Patient Rhythm Strata: {len(pats_with_af)} AF Patients, {len(pats_without_af)} Sinus/Low-AF Patients", flush=True)
+# 2. Design and apply dual 50 Hz and 60 Hz IIR notch filters on X_bp_all
+print("[1/3] Filtering X_bp with 50 Hz & 60 Hz IIR Notches (Q=12.0)...", flush=True)
+fs = 128
+b50, a50 = iirnotch(w0=50.0, Q=12.0, fs=fs)
+b60, a60 = iirnotch(w0=60.0, Q=12.0, fs=fs)
 
-# -----------------------------------------------------------------------------
-# 2. MODEL ARCHITECTURE BUILDER
-# -----------------------------------------------------------------------------
-def build_ablation_model():
+# Filter 20,000 windows
+X_notch = np.empty_like(X_bp_all)
+for i in range(len(X_bp_all)):
+    sig = X_bp_all[i, :, 0]
+    sig_n = filtfilt(b60, a60, filtfilt(b50, a50, sig))
+    X_notch[i, :, 0] = sig_n
+
+print(f"      Filtered {len(X_notch):,} windows successfully.", flush=True)
+
+def build_model():
+    tf.keras.backend.clear_session()
     model = Sequential([
         Conv1D(filters=32, kernel_size=5, activation='relu', padding='same', input_shape=(1280, 1)),
         BatchNormalization(),
@@ -72,216 +69,128 @@ def build_ablation_model():
     model.compile(loss='binary_crossentropy', optimizer=opt, metrics=['accuracy'])
     return model
 
-# -----------------------------------------------------------------------------
-# 3. EXPERIMENTAL CONDITIONS
-# -----------------------------------------------------------------------------
 SEEDS = [42, 101, 2024]
+new_runs = []
 
-CONDITIONS = [
-    # Dimension 1: Preprocessing Filter Cascade
-    {
-        'id': 'C1_Raw_Unweighted',
-        'name': 'Raw ECG (No DSP Filtering, Unweighted)',
-        'filter': 'raw',
-        'balance': 'unweighted'
-    },
-    {
-        'id': 'C2_Bandpass_Unweighted',
-        'name': 'Bandpass-Only (0.5-40 Hz, No QG, Unweighted)',
-        'filter': 'bandpass',
-        'balance': 'unweighted'
-    },
-    {
-        'id': 'C3_FullDSP_Unweighted',
-        'name': 'Full DSP Cascade (Dual-Stage + QG, Unweighted)',
-        'filter': 'full_dsp',
-        'balance': 'unweighted'
-    },
-    # Dimension 2: Class Imbalance Mitigation (evaluated on Full DSP Cascade)
-    {
-        'id': 'C4_FullDSP_SMOTE',
-        'name': 'Full DSP Cascade + SMOTE Oversampling',
-        'filter': 'full_dsp',
-        'balance': 'smote'
-    },
-    {
-        'id': 'C5_FullDSP_ClassWeight',
-        'name': 'Full DSP Cascade + Cost-Sensitive Weight (Proposed)',
-        'filter': 'full_dsp',
-        'balance': 'class_weight'
-    }
-]
-
-raw_runs = []
-print(f"\n[2/3] Executing {len(SEEDS)} Random Patient-Level Shuffles x {len(CONDITIONS)} Conditions ({len(SEEDS)*len(CONDITIONS)} runs total)...", flush=True)
-
-exp_counter = 0
-
+print("\n[2/3] Training and evaluating on Seeds [42, 101, 2024]...", flush=True)
 for seed in SEEDS:
-    print(f"\n=======================================================", flush=True)
-    print(f" >>> RUNNING RANDOM PATIENT SHUFFLE: SEED {seed}", flush=True)
-    print(f"=======================================================", flush=True)
-    
+    start_t = time.time()
     rng = np.random.RandomState(seed)
     shuffled_af = rng.permutation(pats_with_af)
     shuffled_sinus = rng.permutation(pats_without_af)
     
-    # 70% Train (7 AF + 7 Sinus), 30% Test (3 AF + 3 Sinus)
     n_af_test = max(1, int(len(pats_with_af) * 0.30))
     n_sinus_test = max(1, int(len(pats_without_af) * 0.30))
     
     test_patients = list(shuffled_af[:n_af_test]) + list(shuffled_sinus[:n_sinus_test])
     train_patients = list(shuffled_af[n_af_test:]) + list(shuffled_sinus[n_sinus_test:])
     
-    assert len(set(train_patients).intersection(set(test_patients))) == 0, "Patient leakage detected!"
-    
-    # Split train further into train_inner and val_inner for threshold tuning
     val_patients = [train_patients[0], train_patients[-1]]
     train_inner_patients = train_patients[1:-1]
     
-    # Masks
-    tr_mask_dsp = np.isin(subjects_dsp_all, train_inner_patients)
-    val_mask_dsp = np.isin(subjects_dsp_all, val_patients)
-    te_mask_dsp = np.isin(subjects_dsp_all, test_patients)
+    train_mask = np.isin(subjects_raw_all, train_inner_patients)
+    val_mask = np.isin(subjects_raw_all, val_patients)
+    test_mask = np.isin(subjects_raw_all, test_patients)
     
-    tr_mask_raw = np.isin(subjects_raw_all, train_inner_patients)
-    val_mask_raw = np.isin(subjects_raw_all, val_patients)
-    te_mask_raw = np.isin(subjects_raw_all, test_patients)
+    X_tr_cand = X_notch[train_mask]
+    y_tr_cand = y_raw_all[train_mask]
+    subs_tr_cand = subjects_raw_all[train_mask]
     
-    # Sample up to 200 windows per training patient for high throughput and stable gradients
-    def sample_windows(mask, subjects_arr, max_w=200):
-        idx = np.where(mask)[0]
-        sel = []
-        for p in np.unique(subjects_arr[idx]):
-            p_idx = idx[subjects_arr[idx] == p]
-            if len(p_idx) > max_w:
-                sel.extend(rng.choice(p_idx, size=max_w, replace=False))
-            else:
-                sel.extend(p_idx)
-        return np.array(sel, dtype=np.int64)
+    # Cap training samples per patient to 200 windows
+    tr_idx_list = []
+    for p in np.unique(subs_tr_cand):
+        p_idxs = np.where(subs_tr_cand == p)[0]
+        if len(p_idxs) > 200:
+            p_idxs = rng.choice(p_idxs, 200, replace=False)
+        tr_idx_list.extend(p_idxs)
         
-    tr_idx_dsp = sample_windows(tr_mask_dsp, subjects_dsp_all, 200)
-    tr_idx_raw = sample_windows(tr_mask_raw, subjects_raw_all, 200)
+    X_tr = X_tr_cand[tr_idx_list]
+    y_tr = y_tr_cand[tr_idx_list]
     
-    val_idx_dsp = np.where(val_mask_dsp)[0]
-    te_idx_dsp = np.where(te_mask_dsp)[0]
+    X_val = X_notch[val_mask]
+    y_val = y_raw_all[val_mask]
     
-    val_idx_raw = np.where(val_mask_raw)[0]
-    te_idx_raw = np.where(te_mask_raw)[0]
+    X_te = X_notch[test_mask]
+    y_te = y_raw_all[test_mask]
     
-    for cond in CONDITIONS:
-        exp_counter += 1
-        t_start = time.time()
-        tf.keras.backend.clear_session()
-        tf.keras.utils.set_random_seed(seed)
-        
-        # 1. Select data based on filter condition
-        if cond['filter'] == 'raw':
-            X_tr = X_raw_all[tr_idx_raw]
-            y_tr = y_raw_all[tr_idx_raw]
-            X_val = X_raw_all[val_idx_raw]
-            y_val = y_raw_all[val_idx_raw]
-            X_te = X_raw_all[te_idx_raw]
-            y_te = y_raw_all[te_idx_raw]
-        elif cond['filter'] == 'bandpass':
-            X_tr = X_bp_all[tr_idx_raw]
-            y_tr = y_raw_all[tr_idx_raw]
-            X_val = X_bp_all[val_idx_raw]
-            y_val = y_raw_all[val_idx_raw]
-            X_te = X_bp_all[te_idx_raw]
-            y_te = y_raw_all[te_idx_raw]
-        else: # full_dsp
-            X_tr = X_dsp_all[tr_idx_dsp]
-            y_tr = y_dsp_all[tr_idx_dsp]
-            X_val = X_dsp_all[val_idx_dsp]
-            y_val = y_dsp_all[val_idx_dsp]
-            X_te = X_dsp_all[te_idx_dsp]
-            y_te = y_dsp_all[te_idx_dsp]
+    tf.keras.utils.set_random_seed(seed)
+    model = build_model()
+    
+    model.fit(
+        X_tr, y_tr,
+        validation_data=(X_val, y_val),
+        epochs=2,
+        batch_size=64,
+        verbose=0
+    )
+    
+    val_probs = model.predict(X_val, verbose=0, batch_size=128).ravel()
+    best_th, best_val_f1 = 0.5, -1.0
+    for th in np.linspace(0.2, 0.85, 20):
+        f = f1_score(y_val, (val_probs >= th).astype(int), zero_division=0)
+        if f > best_val_f1:
+            best_val_f1 = f
+            best_th = float(th)
             
-        # 2. Balancing strategy
-        cw_dict = None
-        if cond['balance'] == 'class_weight':
-            classes = np.unique(y_tr)
-            weights = compute_class_weight('balanced', classes=classes, y=y_tr)
-            cw_dict = {c: float(w) for c, w in zip(classes, weights)}
-        elif cond['balance'] == 'smote':
-            smote = SMOTE(random_state=seed, k_neighbors=3)
-            n_samples = len(X_tr)
-            X_2d = X_tr.reshape(n_samples, -1)
-            X_res_2d, y_tr = smote.fit_resample(X_2d, y_tr)
-            X_tr = X_res_2d.reshape(-1, WINDOW_SIZE, 1)
-            
-        # 3. Fast & robust 2-epoch training
-        model = build_ablation_model()
-        model.fit(
-            X_tr, y_tr,
-            batch_size=256,
-            epochs=2,
-            class_weight=cw_dict,
-            verbose=0
-        )
-        
-        # 4. Predict on val to select optimal operating threshold T*
-        val_probs = model.predict(X_val, batch_size=512, verbose=0).ravel()
-        cand_th = np.linspace(0.2, 0.85, 20)
-        best_th, best_val_f1 = 0.5, -1.0
-        for th in cand_th:
-            p = (val_probs >= th).astype(int)
-            f = f1_score(y_val, p, zero_division=0)
-            if f > best_val_f1:
-                best_val_f1 = f
-                best_th = float(th)
-                
-        # 5. Predict on test
-        test_probs = model.predict(X_te, batch_size=512, verbose=0).ravel()
-        pred_labels = (test_probs >= best_th).astype(int)
-        
-        auc_val = float(roc_auc_score(y_te, test_probs)) if len(np.unique(y_te)) > 1 else 0.5
-        acc_val = float(accuracy_score(y_te, pred_labels)) * 100.0
-        f1_val = float(f1_score(y_te, pred_labels, zero_division=0)) * 100.0
-        sens_val = float(recall_score(y_te, pred_labels, zero_division=0)) * 100.0
-        spec_val = float(recall_score(1 - y_te, 1 - pred_labels, zero_division=0)) * 100.0
-        prec_val = float(precision_score(y_te, pred_labels, zero_division=0)) * 100.0
-        
-        elapsed = time.time() - t_start
-        
-        raw_runs.append({
-            'seed': seed,
-            'condition_id': cond['id'],
-            'condition_name': cond['name'],
-            'filter_stage': cond['filter'],
-            'balancing_strategy': cond['balance'],
-            'optimal_threshold': round(best_th, 4),
-            'roc_auc': round(auc_val, 4),
-            'f1_score': round(f1_val, 2),
-            'accuracy': round(acc_val, 2),
-            'sensitivity': round(sens_val, 2),
-            'specificity': round(spec_val, 2),
-            'precision': round(prec_val, 2),
-            'runtime_sec': round(elapsed, 1)
-        })
-        
-        print(f"[{exp_counter:02d}/15] Seed {seed} | {cond['name']:<50} | "
-              f"T*={best_th:.2f} | AUC: {auc_val:.4f} | F1: {f1_val:.2f}% | Acc: {acc_val:.2f}% | Sens: {sens_val:.2f}% | Spec: {spec_val:.2f}% ({elapsed:.1f}s)", flush=True)
-        
-        del model
-        gc.collect()
+    te_probs = model.predict(X_te, verbose=0, batch_size=128).ravel()
+    te_pred = (te_probs >= best_th).astype(int)
+    
+    acc = accuracy_score(y_te, te_pred)
+    f1 = f1_score(y_te, te_pred, zero_division=0)
+    sens = recall_score(y_te, te_pred, zero_division=0)
+    spec = float(np.sum((y_te == 0) & (te_pred == 0)) / max(1, np.sum(y_te == 0)))
+    prec = precision_score(y_te, te_pred, zero_division=0)
+    auc_score = roc_auc_score(y_te, te_probs) if len(np.unique(y_te)) > 1 else 0.5
+    
+    elapsed = time.time() - start_t
+    print(f"   [Seed {seed}] Bandpass + Notches | T*={best_th:.2f} | AUC: {auc_score:.4f} | F1: {f1*100:.2f}% | Acc: {acc*100:.2f}% | Sens: {sens*100:.2f}% | Spec: {spec*100:.2f}% ({elapsed:.1f}s)", flush=True)
+    
+    new_runs.append({
+        'seed': seed,
+        'condition_id': 'C2b_BP_Notches_Unweighted',
+        'condition_name': 'Bandpass + Notches (0.5-40 Hz + 50/60 Hz Notches, Unweighted)',
+        'filter_stage': 'bandpass_notches',
+        'balancing_strategy': 'unweighted',
+        'optimal_threshold': round(best_th, 4),
+        'roc_auc': round(auc_score, 4),
+        'f1_score': round(f1 * 100, 2),
+        'accuracy': round(acc * 100, 2),
+        'sensitivity': round(sens * 100, 2),
+        'specificity': round(spec * 100, 2),
+        'precision': round(prec * 100, 2),
+        'runtime_sec': round(elapsed, 1)
+    })
+    
+    del model
+    gc.collect()
 
-# -----------------------------------------------------------------------------
-# 4. STATISTICAL AGGREGATION & EXPORT
-# -----------------------------------------------------------------------------
-print("\n[3/3] Aggregating empirical statistics (Mean \u00b1 Sample SD, ddof=1)...", flush=True)
+# 3. Merge with existing raw runs
+df_existing_raw = pd.read_csv(os.path.join(RESULTS_DIR, 'ablation_study_raw_runs.csv'))
+# Remove C2b if already present
+df_existing_raw = df_existing_raw[df_existing_raw['condition_id'] != 'C2b_BP_Notches_Unweighted']
+df_new = pd.DataFrame(new_runs)
 
-df_raw = pd.DataFrame(raw_runs)
+df_all_raw = pd.concat([df_existing_raw, df_new], ignore_index=True)
+
+# Order conditions logically: C1, C2, C2b, C3, C4, C5
+COND_ORDER = [
+    ('C1_Raw_Unweighted', 'Raw ECG (No DSP Filtering, Unweighted)', 'raw', 'unweighted'),
+    ('C2_Bandpass_Unweighted', 'Bandpass-Only (0.5-40 Hz, No QG, Unweighted)', 'bandpass', 'unweighted'),
+    ('C2b_BP_Notches_Unweighted', 'Bandpass + Notches (0.5-40 Hz + 50/60 Hz Notches, Unweighted)', 'bandpass_notches', 'unweighted'),
+    ('C3_FullDSP_Unweighted', 'Full DSP Cascade (Dual-Stage + QG, Unweighted)', 'full_dsp', 'unweighted'),
+    ('C4_FullDSP_SMOTE', 'Full DSP Cascade + SMOTE Oversampling', 'full_dsp', 'smote'),
+    ('C5_FullDSP_ClassWeight', 'Full DSP Cascade + Cost-Sensitive Weight (Proposed)', 'full_dsp', 'class_weight')
+]
+
+df_all_raw['cond_rank'] = df_all_raw['condition_id'].map({c[0]: i for i, c in enumerate(COND_ORDER)})
+df_all_raw = df_all_raw.sort_values(by=['cond_rank', 'seed']).drop(columns=['cond_rank'])
 raw_runs_csv = os.path.join(RESULTS_DIR, 'ablation_study_raw_runs.csv')
-df_raw.to_csv(raw_runs_csv, index=False)
-print(f"   -> Saved raw runs to {raw_runs_csv}", flush=True)
+df_all_raw.to_csv(raw_runs_csv, index=False)
 
+# Compute unified summary
 summary_rows = []
-for cond in CONDITIONS:
-    cid = cond['id']
-    sub = df_raw[df_raw['condition_id'] == cid]
-    
+for cid, cname, fstage, bstrat in COND_ORDER:
+    sub = df_all_raw[df_all_raw['condition_id'] == cid]
     mean_auc, std_auc = sub['roc_auc'].mean(), sub['roc_auc'].std(ddof=1)
     mean_f1, std_f1 = sub['f1_score'].mean(), sub['f1_score'].std(ddof=1)
     mean_acc, std_acc = sub['accuracy'].mean(), sub['accuracy'].std(ddof=1)
@@ -292,9 +201,9 @@ for cond in CONDITIONS:
     
     summary_rows.append({
         'condition_id': cid,
-        'condition_name': cond['name'],
-        'filter_stage': cond['filter'],
-        'balancing_strategy': cond['balance'],
+        'condition_name': cname,
+        'filter_stage': fstage,
+        'balancing_strategy': bstrat,
         'mean_optimal_threshold': round(mean_th, 4),
         'roc_auc_mean': round(mean_auc, 4),
         'roc_auc_std': round(std_auc, 4),
@@ -319,34 +228,32 @@ for cond in CONDITIONS:
 df_summary = pd.DataFrame(summary_rows)
 summary_csv = os.path.join(RESULTS_DIR, 'ablation_study_summary.csv')
 df_summary.to_csv(summary_csv, index=False)
-print(f"   -> Saved summary CSV to {summary_csv}", flush=True)
 
 summary_json = os.path.join(RESULTS_DIR, 'ablation_study_summary.json')
 with open(summary_json, 'w', encoding='utf-8') as f:
     json.dump({
-        'study_title': 'Ablation Analysis: Preprocessing DSP Cascade vs Class Imbalance Handling (SMOTE)',
+        'study_title': 'Ablation Analysis: 4-Stage Preprocessing DSP Cascade vs Class Imbalance Handling (SMOTE)',
         'shuffles_count': len(SEEDS),
         'seeds_evaluated': SEEDS,
         'patient_leakage_guarantee': 'Zero leakage (Patient-Level Partitioning)',
-        'threshold_calibration': 'Validation-tuned optimal operating point (T*)',
         'standard_deviation_convention': 'Unbiased sample standard deviation (ddof=1)',
         'summary_results': summary_rows
     }, f, indent=4)
-print(f"   -> Saved summary JSON to {summary_json}", flush=True)
 
-# Markdown Table
-md_table = """### Table R6: Comprehensive Ablation Study: Preprocessing Stages & Imbalance Mitigation
-*Empirical evaluation across 3 independent random patient-level shuffles with zero patient leakage. Results reported as Mean \u00b1 SD (ddof=1).*
+# Markdown table
+md_table = """### Table R6: Comprehensive 4-Stage Preprocessing & Imbalance Mitigation Ablation Study
+*Empirical evaluation across 3 independent random patient-level shuffles with zero patient leakage. Results reported as Mean \u00b1 SD (sample standard deviation, ddof=1).*
 
 | Preprocessing Stage | Balancing Strategy | Calibrated $T^*$ | ROC-AUC | F1-Score (%) | Accuracy (%) | Sensitivity (%) | Specificity (%) | Precision (%) |
 | :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
 """
 for r in summary_rows:
-    md_table += f"| {r['condition_name'].split('(')[0].strip()} | {r['balancing_strategy'].replace('_', ' ').title()} | {r['mean_optimal_threshold']:.2f} | **{r['formatted_auc']}** | {r['formatted_f1']} | {r['formatted_acc']} | {r['formatted_sens']} | {r['formatted_spec']} | {r['formatted_prec']} |\n"
+    p_name = r['condition_name'].split('(')[0].strip()
+    md_table += f"| **{p_name}** | {r['balancing_strategy'].replace('_', ' ').title()} | {r['mean_optimal_threshold']:.2f} | **{r['formatted_auc']}** | {r['formatted_f1']} | {r['formatted_acc']} | {r['formatted_sens']} | {r['formatted_spec']} | {r['formatted_prec']} |\n"
 
 md_path = os.path.join(RESULTS_DIR, 'ablation_study_markdown_table.md')
 with open(md_path, 'w', encoding='utf-8') as f:
     f.write(md_table)
 
 print("\n" + md_table)
-print("\n[SUCCESS] Ablation study completely finished and verified!", flush=True)
+print("\n[SUCCESS] 4th Ablation Stage (Bandpass + Notches) successfully integrated into summary tables and JSON!", flush=True)

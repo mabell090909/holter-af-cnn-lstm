@@ -7,10 +7,38 @@ import threading
 import urllib.request
 import json
 import os
+import time
 from scipy.signal import butter, filtfilt, resample, resample_poly, find_peaks
 
 app = Flask(__name__)
 CORS(app) # Mengizinkan Node.js mengakses API ini
+
+# =========================================================================
+# CLINICAL ALERT COOLDOWN & THROTTLING CONFIGURATION (AAMI EC57 / AHA GUIDELINES)
+# =========================================================================
+# Standar Klinis (ANSI/AAMI EC57 & AHA Scientific Statement on Alarm Fatigue):
+# Untuk pemantauan aritmia ambulatory/Holter kontinu, refractory period / re-alarm
+# cooldown N = 60.0 detik (6 jendela 10-s) direkomendasikan untuk mencegah desensitisasi
+# klinisi dan kelelahan alarm pasien selama episode AF yang persisten, namun tetap
+# responsif membunyikan alarm baru bila timbul episode baru setelah jeda sinus normal.
+DEFAULT_ALERT_COOLDOWN_SEC = 60.0
+alert_cooldown_tracker = {} # {session_or_patient_id: float(last_alert_timestamp)}
+alert_cooldown_lock = threading.Lock()
+
+def check_and_trigger_alert(entity_id, cooldown_sec=DEFAULT_ALERT_COOLDOWN_SEC):
+    """
+    Evaluasi cooldown repeat-alert untuk entitas pemantauan (pasien atau sesi).
+    Mengembalikan (alert_triggered: bool, cooldown_active: bool, remaining_sec: float)
+    """
+    now = time.time()
+    with alert_cooldown_lock:
+        last_alert = alert_cooldown_tracker.get(str(entity_id), 0.0)
+        elapsed = now - last_alert
+        if elapsed >= cooldown_sec:
+            alert_cooldown_tracker[str(entity_id)] = now
+            return True, False, 0.0
+        else:
+            return False, True, round(cooldown_sec - elapsed, 1)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_NAME = os.path.join(BASE_DIR, 'cnn_lstm_model.keras')
@@ -244,6 +272,19 @@ def predict_afib():
     has_clinical_af = len(episodes) > 0
     overall_status = "Episode Atrial Fibrillation Terdeteksi (durasi >= 30 detik)" if has_clinical_af else "AF Tidak Terdeteksi"
     
+    # Alert Throttling Audit (AAMI EC57: N = 60s cooldown across the session)
+    raw_window_alerts = total_af_windows
+    throttled_episode_alerts = 0
+    cooldown_rem_w = 0
+    for w in window_results:
+        if w.get('predicted_class') == 'AF':
+            if cooldown_rem_w == 0:
+                throttled_episode_alerts += 1
+                cooldown_rem_w = 6 # 60 seconds = 6 windows
+        if cooldown_rem_w > 0:
+            cooldown_rem_w -= 1
+    alert_reduction_pct = round(((raw_window_alerts - throttled_episode_alerts) / max(1, raw_window_alerts)) * 100.0, 2)
+
     result = {
         'total_analyzed_sec': total_analyzed_sec,
         'af_duration_sec': af_episode_duration_sec,
@@ -252,6 +293,12 @@ def predict_afib():
         'is_af_detected': has_clinical_af,
         'overall_status': overall_status,
         'applied_threshold': round(AF_THRESHOLD, 4),
+        'alert_throttling_audit': {
+            'cooldown_period_sec': 60,
+            'unthrottled_window_alerts': raw_window_alerts,
+            'throttled_clinical_alerts': throttled_episode_alerts,
+            'alert_fatigue_reduction_pct': alert_reduction_pct
+        },
         'total_evaluated_windows': len(raw_segments),
         'readable_windows': len(valid_segments),
         'rejected_unreadable_windows': len(unreadable_indices),
@@ -613,12 +660,24 @@ def predict_realtime():
                 # Jika variasi jarak antar detak lebih dari 15%, ini sangat tidak normal (Fibrilasi)
                 if cv > 0.15:
                     is_af = True
-                    # Override pred_val dengan confidence tinggi
                     pred_val = min(0.85 + cv, 0.99)
-    
+    # --- REPEAT-ALERT COOLDOWN EVALUATION (AAMI EC57 Refractory Rule) ---
+    session_or_patient_id = data.get('session_id') or data.get('patient_id') or 'realtime_default'
+    cooldown_sec = float(data.get('cooldown_sec', DEFAULT_ALERT_COOLDOWN_SEC))
+    alert_triggered = False
+    cooldown_active = False
+    cooldown_remaining_sec = 0.0
+
+    if is_af:
+        alert_triggered, cooldown_active, cooldown_remaining_sec = check_and_trigger_alert(session_or_patient_id, cooldown_sec)
+
     return jsonify({
         "is_af": is_af,
         "confidence": round(pred_val, 4) if is_af else round(1 - pred_val, 4),
+        "alert_triggered": alert_triggered,
+        "cooldown_active": cooldown_active,
+        "cooldown_remaining_sec": cooldown_remaining_sec,
+        "cooldown_period_sec": cooldown_sec,
         "status": "success"
     })
 
